@@ -1,0 +1,23 @@
+Screen {
+        layout: vertical;
+    }
+
+#main {
+    layout: horizontal;
+    height: 1fr;
+}
+
+#hosts {
+    width: 30%;
+    border: round green;
+}
+
+#roles {
+    width: 40%;
+    border: round cyan;
+}
+
+#preview {
+    border: round yellow;
+    height: 5;
+}
