@@ -1,4 +1,5 @@
 import asyncio
+import sys
 import yaml
 from pathlib import Path
 from textual.app import App, ComposeResult
@@ -7,6 +8,7 @@ from textual.widgets import Header, Footer, Tree, Static, Input
 from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual import events
+from textual.widgets import Log
 
 
 # -------------------------
@@ -53,6 +55,15 @@ class AnsibleTUI(App):
     current_command = reactive("")
     run_output = reactive("") 
 
+
+    # -------------------------
+    # Accept a working directory on startup
+    # -------------------------
+
+    def __init__(self, project_path: Path | None = None, **kwargs):
+        super().__init__(**kwargs)
+        self.project_path = Path(project_path).resolve() if project_path else Path.cwd()
+
     # -------------------------
     # UI Construction
     # -------------------------
@@ -68,7 +79,10 @@ class AnsibleTUI(App):
             yield self.role_tree
 
         self.preview = Static("", id="preview")
+        self.output_log = Log(id="output")
+
         yield self.preview
+        yield self.output_log
         yield Footer()
 
     # -------------------------
@@ -101,7 +115,7 @@ class AnsibleTUI(App):
     # -------------------------
 
     def load_inventory(self):
-        inventory_file = Path("inventory.yml")
+        inventory_file = self.project_path / "inventory.yml"
 
         if not inventory_file.exists():
             data = {
@@ -170,7 +184,7 @@ class AnsibleTUI(App):
     # -------------------------
 
     def load_roles(self):
-        roles_path = Path("roles")
+        roles_path = self.project_path / "roles"
 
         root = self.role_tree.root
         root.expand()
@@ -281,7 +295,10 @@ class AnsibleTUI(App):
     # -------------------------
     
     def update_preview(self):
-        cmd = "ansible-playbook playbook.yml"
+        playbook = self.project_path / "playbook.yml"
+        inventory = self.project_path / "inventory.yml"
+
+        cmd = f"ansible-playbook -i {inventory} {playbook}"
 
         if self.selected_hosts:
             cmd += f" --limit {','.join(self.selected_hosts)}"
@@ -309,23 +326,23 @@ class AnsibleTUI(App):
     # -------------------------
     async def action_run_playbook(self):
         cmd = self.current_command
-        self.run_output = "Running...\n"
-        self.preview.update(self.run_output)
+        self.output_log.clear()
+        self.output_log.write_line(f"Running: {cmd}")
 
         process = await asyncio.create_subprocess_shell(
             cmd,
+            cwd=self.project_path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT
         )
 
         async for line in process.stdout:
-            self.run_output += line.decode()
-            self.preview.update(self.run_output)
+            self.output_log.write_line(line.decode().rstrip())
 
         await process.wait()
-        self.run_output += "\n✓ Run complete"
-        self.preview.update(self.run_output)
-    
+        self.output_log.write_line("✓ Run complete")
+
 
 if __name__ == "__main__":
-    AnsibleTUI().run()
+    project_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else None
+    AnsibleTUI(project_dir).run()
