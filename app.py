@@ -1,3 +1,4 @@
+import shutil 
 import tempfile
 import os
 import asyncio
@@ -65,51 +66,54 @@ class AnsibleProject:
     # -------------------------
     # Load Inventory via ansible
     # -------------------------
-
+    
     def load_inventory(self, vault_password: str | None = None):
+        # Ensure we use the correct FreeBSD path
+        ansible_bin = "/usr/local/bin/ansible-inventory"
+        if not os.path.exists(ansible_bin):
+            import shutil
+            ansible_bin = shutil.which("ansible-inventory") or "ansible-inventory"
 
         cmd = [
-            "ansible-inventory",
-            "-i",
-            str(self.inventory_path),
+            ansible_bin,
+            "-i", str(self.inventory_path),
             "--list",
         ]
 
-        temp_path = None
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        # Prevent Ansible from ever trying to prompt the terminal
+        env["ANSIBLE_ASK_VAULT_PASS"] = "False" 
 
+        password_file = None
         try:
             if vault_password:
-
-                with tempfile.NamedTemporaryFile(
-                    mode="w",
-                    delete=False,
-                    prefix="ansible_vault_",
-                ) as f:
-                    f.write(vault_password + "\n")
-                    temp_path = f.name
-
-                os.chmod(temp_path, 0o600)
-
-                cmd.extend(["--vault-password-file", temp_path])
-
-            print("RUNNING:", " ".join(cmd))  # keep temporarily
+                # Create a temporary file for the password
+                with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
+                    f.write(vault_password)
+                    password_file = f.name
+                cmd.extend(["--vault-password-file", password_file])
 
             result = subprocess.run(
                 cmd,
                 text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                capture_output=True,
                 cwd=self.root,
+                env=env,
+                stdin=subprocess.DEVNULL, # Tell Ansible there is no keyboard input
+                timeout=30
             )
 
             if result.returncode != 0:
-                raise RuntimeError(result.stderr)
+                return {"error": result.stderr}
 
             return json.loads(result.stdout)
 
         finally:
-            if temp_path and os.path.exists(temp_path):
-                os.unlink(temp_path)
+            # Always clean up the password file
+            if password_file and os.path.exists(password_file):
+                os.remove(password_file)
+    
 
     # -------------------------
     # Detect Playbooks
@@ -131,14 +135,16 @@ class AnsibleProject:
     # Handle projects with a vault
     # -------------------------
     def project_uses_vault(self) -> bool:
+        # Avoid scanning hidden directories like .git or .venv
         for path in self.root.rglob("*.yml"):
+            if any(part.startswith('.') for part in path.parts):
+                continue
             try:
                 if "$ANSIBLE_VAULT" in path.read_text(errors="ignore"):
                     return True
             except Exception:
                 pass
         return False
-
 
 # -------------------------
 # Command Builder
@@ -357,29 +363,38 @@ class AnsibleTUI(App):
     # -------------------------
     # Load Project Worker
     # -------------------------
-    
+
     async def load_project_worker(self):
+        self.output_log.write_line("Checking for vaulted files...")
+    
+        # Check for vault string in project files (Async to keep UI alive)
+        has_vault = await asyncio.to_thread(self.project.project_uses_vault)
 
-        # --- vault ---
-        if self.project.project_uses_vault():
-            password = await self.push_screen_wait(VaultModal())
-            if not password:
-                return
-            self.vault_password = password
+        if has_vault:
+            self.output_log.write_line("Vault detected. Requesting password...")
+            # This waits for the user to type in the Modal
+            self.vault_password = await self.push_screen_wait(VaultModal())
+            if not self.vault_password:
+                self.output_log.write_line("[yellow]Warning: No vault password provided.[/yellow]")
 
-        # --- load inventory safely ---
-        print("Before Load")
+        self.output_log.write_line("Loading inventory (this may take a moment)...")
+    
+        # Run the heavy subprocess in a thread so it doesn't freeze the TUI
         self.inventory_data = await asyncio.to_thread(
-            self._load_inventory_blocking
+            self.project.load_inventory, 
+            self.vault_password
         )
-        print("After Load")
-        # --- update UI (now safe) ---
+
+        if "error" in self.inventory_data:
+            self.output_log.write_line(f"[red]Failed to load inventory:[/red]\n{self.inventory_data['error']}")
+            return
+
+        # Now that we have data, populate the UI
         self.populate_inventory_tree()
         self.load_roles()
         self.load_playbooks()
-        self.update_preview()
-
-
+        self.output_log.write_line("[green]✓ Project loaded successfully.[/green]")
+   
     # -------------------------
     # UI Update
     # -------------------------
