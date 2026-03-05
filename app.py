@@ -8,7 +8,7 @@ from pathlib import Path
 from pathlib import Path
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Header, Footer, Tree, Static, Input, Log, Select, Button
+from textual.widgets import Header, Footer, Tree, Static, Input, RichLog, Select, Button, LoadingIndicator
 from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual import events
@@ -282,7 +282,7 @@ class AnsibleTUI(App):
 
             # Hosts
             with Vertical():
-                yield Tree("Hosts", id="hosts")
+                yield Tree("Inventory", id="inventory_tree")
 
             # Roles
             with Vertical():
@@ -302,14 +302,14 @@ class AnsibleTUI(App):
         yield self.preview_widget
 
         # ------LOGS ---
-        self.output_log = Log(id="output")
+        self.output_log = RichLog(id="output", highlight=True, markup=True)
         yield self.output_log
 
         yield Footer()
 
     @property
     def host_tree(self) -> Tree:
-        return self.query_one("#hosts", Tree)
+        return self.query_one("#inventory_tree", Tree)
 
     @property
     def role_tree(self) -> Tree:
@@ -363,37 +363,51 @@ class AnsibleTUI(App):
     # -------------------------
     # Load Project Worker
     # -------------------------
-
+    
     async def load_project_worker(self):
-        self.output_log.write_line("Checking for vaulted files...")
+        # 1. Start the Spinner
+        spinner = LoadingIndicator()
+        await self.mount(spinner)
     
-        # Check for vault string in project files (Async to keep UI alive)
-        has_vault = await asyncio.to_thread(self.project.project_uses_vault)
+        try:
+            self.output_log.write("Checking for Vault...")
+            has_vault = await asyncio.to_thread(self.project.project_uses_vault)
 
-        if has_vault:
-            self.output_log.write_line("Vault detected. Requesting password...")
-            # This waits for the user to type in the Modal
-            self.vault_password = await self.push_screen_wait(VaultModal())
-            if not self.vault_password:
-                self.output_log.write_line("[yellow]Warning: No vault password provided.[/yellow]")
+            if has_vault:
+                # We must remove the spinner before pushing the Modal, 
+                # or the spinner might block the password input.
+                await spinner.remove() 
+                self.vault_password = await self.push_screen_wait(VaultModal())
+                # Re-mount spinner for the actual inventory load
+                spinner = LoadingIndicator()
+                await self.mount(spinner)
 
-        self.output_log.write_line("Loading inventory (this may take a moment)...")
-    
-        # Run the heavy subprocess in a thread so it doesn't freeze the TUI
-        self.inventory_data = await asyncio.to_thread(
-            self.project.load_inventory, 
-            self.vault_password
-        )
+            self.output_log.write("Querying Vultr inventory...")
+        
+            # Run the blocking inventory call in a thread
+            self.inventory_data = await asyncio.to_thread(
+                self.project.load_inventory, 
+                self.vault_password
+            )
 
-        if "error" in self.inventory_data:
-            self.output_log.write_line(f"[red]Failed to load inventory:[/red]\n{self.inventory_data['error']}")
-            return
+            if "error" in self.inventory_data:
+                self.output_log.write(f"[red]Error:[/red] {self.inventory_data['error']}")
+                return
 
-        # Now that we have data, populate the UI
-        self.populate_inventory_tree()
-        self.load_roles()
-        self.load_playbooks()
-        self.output_log.write_line("[green]✓ Project loaded successfully.[/green]")
+            # 2. Populate UI with the new data
+            self.populate_inventory_tree()
+            self.load_roles()
+            self.load_playbooks()
+            self.output_log.write(f"[green]✓ Load complete.[/green]")
+
+        except Exception as e:
+            self.output_log.write(f"[red]Unexpected error: {e}[/red]")
+        finally:
+            # 3. Always ensure the spinner is removed
+            try:
+                await spinner.remove()
+            except:
+                pass
    
     # -------------------------
     # UI Update
@@ -428,45 +442,29 @@ class AnsibleTUI(App):
     # -------------------------
     #  Populate inventorty Tree
     # -------------------------
+
     def populate_inventory_tree(self):
-
-        tree = self.host_tree
+        tree = self.query_one("#inventory_tree", Tree)
         tree.clear()
-
         root = tree.root
-        root.label = "Hosts"
         root.expand()
 
-        data = self.inventory_data
-
-        # groups listed under "all"
-        groups = data.get("all", {}).get("children", [])
-
-        for group_name in groups:
-
+        for group, data in self.inventory_data.items():
+            if group == "_meta": continue
+            # Groups are also nodes that can be checked/unchecked
             group_node = root.add(
-                group_name,
-                data={
-                    "type": "group",
-                    "name": group_name,
-                    "checked": False,
-                },
+                f"[bold cyan]{group}[/bold cyan]", 
+                data={"type": "group", "name": group, "checked": False},
+                expand=True
             )
-
-            group = data.get(group_name, {})
-            hosts = group.get("hosts", [])
-
+            
+            hosts = data.get("hosts", [])
             for host in hosts:
-                group_node.add(
-                    f"[ ] {host}",
-                    data={
-                        "type": "host",
-                        "name": host,
-                        "checked": False,
-                    },
+                # IMPORTANT: Data must be a dictionary, not just a string
+                group_node.add_leaf(
+                    f"☐ {host}", 
+                    data={"type": "host", "name": host, "checked": False}
                 )
-
-            group_node.expand()
 
     # -------------------------
     # Render Function
@@ -489,7 +487,11 @@ class AnsibleTUI(App):
     # -------------------------
 
     def refresh_node(self, node):
-        node.set_label(self.render_node_label(node))
+        if node.data and "checked" in node.data:
+            name = node.data["name"]
+            prefix = "☑" if node.data["checked"] else "☐"
+            node.label = f"{prefix} {name}"
+
 
     # -------------------------
     # Recursive Walk Helper
@@ -541,6 +543,27 @@ class AnsibleTUI(App):
         self.update_preview()
 
     # -------------------------
+    # Node selection event handling
+    # -------------------------
+
+    def on_tree_node_selected(self, event: Tree.NodeSelected):
+        node = event.node
+        if node.data and "checked" in node.data:
+            # Toggle the state in the dictionary
+            node.data["checked"] = not node.data["checked"]
+            
+            # Update the visual label (checkbox)
+            host_name = node.data["name"]
+            if node.data["checked"]:
+                node.label = f"☑ {host_name}"
+            else:
+                node.label = f"☐ {host_name}"
+            
+            # Sync the sets and update preview
+            self.update_selected_sets()
+            self.update_preview()
+
+    # -------------------------
     # Recursive State Propogation
     # -------------------------
 
@@ -582,21 +605,11 @@ class AnsibleTUI(App):
 
     async def action_all_hosts(self):
         for node in self.walk_tree(self.host_tree.root):
-            if node.data and node.data["type"] == "host":
-                node.data["checked"] =True
+            if node.data and node.data.get("type") == "host":
+                node.data["checked"] = True
                 self.refresh_node(node)
 
         self.update_selected_sets()
-        self.update_preview()
-
-    # -------------------------
-    # Vault Prompt
-    # -------------------------
-
-    async def action_vault_prompt(self):
-        password = await self.push_screen_wait(VaultModal())
-        if password:
-            self.vault_password = password
         self.update_preview()
 
     # -------------------------
@@ -621,22 +634,23 @@ class AnsibleTUI(App):
     # -------------------------
     # Command Preview
     # -------------------------
-    
+
     def update_preview(self):
-        self.command_builder.hosts = set(self.selected_hosts)
-        self.command_builder.roles = set(self.selected_roles)
+        # The builder handles the logic of joining hosts and roles
+        self.command_builder.hosts = self.selected_hosts
+        self.command_builder.roles = self.selected_roles
         self.command_builder.check = self.check_mode
         self.command_builder.diff = self.diff_mode
-
+        
         cmd = self.command_builder.build()
 
         if self.vault_password:
-            cmd += " --ask-vault-pass"
+            # We add this here because the Builder doesn't know about the UI password state
+            cmd += " --vault-password-file .vault_pass"
 
         self.current_command = cmd
-        self.preview.update(cmd)
-
-
+        self.query_one("#preview", Static).update(f"[bold green]{cmd}[/bold green]")
+    
     # -------------------------
     # Run Playbook
     # -------------------------

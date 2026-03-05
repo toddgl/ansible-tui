@@ -21,3 +21,13 @@ Screen {
     border: round yellow;
     height: 5;
 }
+
+LoadingIndicator {
+    background: $boost;
+    color: $accent;
+    border: double $accent;
+    width: 30%;
+    height: 5;
+    /* Center it on screen */
+    margin: 10 35; 
+}
