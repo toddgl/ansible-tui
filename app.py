@@ -445,7 +445,6 @@ class AnsibleTUI(App):
 
     def populate_inventory_tree(self):
         tree = self.query_one("#inventory_tree", Tree)
-        tree.clear()
         root = tree.root
         root.expand()
 
@@ -471,15 +470,17 @@ class AnsibleTUI(App):
     # -------------------------
 
     def render_node_label(self, node):
-        if not node.data:
+        if not node.data or "checked" not in node.data:
             return node.label
 
         checked = node.data.get("checked", False)
         name = node.data["name"]
-
-        checkbox = "[green][x][/green]" if checked else "[dim][ ][/dim]"
+        # Use the Unicode symbols as requested
+        checkbox = "☑" if checked else "☐"
         
         return f"{checkbox} {name}"
+
+
 
 
     # -------------------------
@@ -487,11 +488,7 @@ class AnsibleTUI(App):
     # -------------------------
 
     def refresh_node(self, node):
-        if node.data and "checked" in node.data:
-            name = node.data["name"]
-            prefix = "☑" if node.data["checked"] else "☐"
-            node.label = f"{prefix} {name}"
-
+        node.label = self.render_node_label(node)
 
     # -------------------------
     # Recursive Walk Helper
@@ -508,7 +505,6 @@ class AnsibleTUI(App):
 
     def load_roles(self):
         roles_path = self.project.root / "roles"
-
         root = self.role_tree.root
         root.expand()
 
@@ -524,6 +520,7 @@ class AnsibleTUI(App):
     # -------------------------
     # Toggle Selection
     # -------------------------
+
 
     async def action_toggle(self):
         tree = self.focused
@@ -545,23 +542,41 @@ class AnsibleTUI(App):
     # -------------------------
     # Node selection event handling
     # -------------------------
-
+    
     def on_tree_node_selected(self, event: Tree.NodeSelected):
-        node = event.node
+        """Handles Mouse Clicks and Enter Key."""
+        self.toggle_node_state(event.node)
+
+    async def action_toggle(self):
+        """Handles Spacebar via BINDINGS."""
+        if isinstance(self.focused, Tree):
+            if self.focused.cursor_node:
+                self.toggle_node_state(self.focused.cursor_node)
+
+    def toggle_node_state(self, node):
+        """Unified logic to change check state and update UI."""
         if node.data and "checked" in node.data:
-            # Toggle the state in the dictionary
             node.data["checked"] = not node.data["checked"]
-            
-            # Update the visual label (checkbox)
-            host_name = node.data["name"]
-            if node.data["checked"]:
-                node.label = f"☑ {host_name}"
-            else:
-                node.label = f"☐ {host_name}"
-            
-            # Sync the sets and update preview
+            self.refresh_node(node)
             self.update_selected_sets()
             self.update_preview()
+
+    def update_preview(self):
+        # Sync reactive states to the builder
+        self.command_builder.hosts = self.selected_hosts
+        self.command_builder.roles = self.selected_roles
+        self.command_builder.check = self.check_mode
+        self.command_builder.diff = self.diff_mode
+        
+        # CommandBuilder.build() already adds --limit and --tags
+        cmd = self.command_builder.build()
+
+        if self.vault_password:
+            # We add this placeholder here; the actual path is injected in action_run_playbook
+            cmd += " --vault-password-file .vault_pass"
+
+        self.current_command = cmd
+        self.query_one("#preview", Static).update(f"[bold green]{cmd}[/bold green]")
 
     # -------------------------
     # Recursive State Propogation
@@ -654,24 +669,42 @@ class AnsibleTUI(App):
     # -------------------------
     # Run Playbook
     # -------------------------
-    async def action_run_playbook(self):
-        cmd = self.command_builder.build()
 
-        self.output_log.clear()
-        self.output_log.write_line(f"Running: {cmd}")
+    async def action_run_playbook(self):
+        if not self.current_command:
+            return
+
+        log = self.query_one("#output", RichLog)
+        log.clear()
+        
+        pass_file = None
+        final_cmd = self.current_command
+        
+        if self.vault_password:
+            pass_file = tempfile.NamedTemporaryFile(mode="w", delete=False)
+            pass_file.write(self.vault_password)
+            pass_file.close()
+            final_cmd = final_cmd.replace(".vault_pass", pass_file.name)
+
+        log.write(f"Executing: {final_cmd}\n")
 
         process = await asyncio.create_subprocess_shell(
-            cmd,
+            final_cmd,
             cwd=self.project.root,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
 
         async for line in process.stdout:
-            self.output_log.write_line(line.decode().rstrip())
+            # FIX: Use .write() for RichLog
+            log.write(line.decode().rstrip() + "\n")
 
         await process.wait()
-        self.output_log.write_line("✓ Run complete")
+        
+        if pass_file:
+            os.unlink(pass_file.name)
+            
+        log.write("\n[bold green]✓ Playbook run finished.[/bold green]\n")
 
 
 if __name__ == "__main__":
