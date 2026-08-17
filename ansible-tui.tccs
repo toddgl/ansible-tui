@@ -31,3 +31,19 @@ LoadingIndicator {
     /* Center it on screen */
     margin: 10 35; 
 }
+
+#status-bar {
+    height: 1;
+    background: $boost;
+    padding: 0 1;
+    margin-bottom: 1;
+}
+
+#status-bar Static {
+    margin-right: 2;
+}
+
+#status-label {
+    text-style: bold;
+    color: $accent;
+}

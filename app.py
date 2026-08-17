@@ -5,7 +5,6 @@ import asyncio
 import sys
 import yaml
 from pathlib import Path
-from pathlib import Path
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Header, Footer, Tree, Static, Input, RichLog, Select, Button, LoadingIndicator
@@ -16,7 +15,6 @@ from textual.screen import ModalScreen
 
 import subprocess
 import json
-from pathlib import Path
 
 
 class AnsibleProject:
@@ -158,28 +156,47 @@ class CommandBuilder:
         self.roles: set[str] = set()
         self.check = False
         self.diff = False
+        self.become = False
+        self.run_as_root = False
 
-    def build(self) -> str:
+    def build(self) -> list[str]:
         if not self.playbook:
-            return "No playbook selected"
+            return []
 
         inventory = self.project.detect_inventory()
-        cmd = f"ansible-playbook -i {inventory} {self.playbook.name}"
+
+        parts = [
+            "ansible-playbook",
+            "-i",
+            str(inventory),
+            str(self.playbook),
+        ]
 
         if self.hosts:
-            cmd += f" --limit {','.join(sorted(self.hosts))}"
+            parts.extend([
+                "--limit",
+                ",".join(sorted(self.hosts)),
+            ])
 
         if self.roles:
-            cmd += f" --tags {','.join(sorted(self.roles))}"
+            parts.extend([
+                "--tags",
+                ",".join(sorted(self.roles)),
+            ])
 
         if self.check:
-            cmd += " --check"
+            parts.append("--check")
 
         if self.diff:
-            cmd += " --diff"
+            parts.append("--diff")
 
-        return cmd
+        if self.become:
+            parts.append("--become")
 
+        if self.run_as_root:
+            parts.insert(0, "sudo")
+
+        return parts
 
 # -------------------------
 # Vault Password Modal
@@ -216,6 +233,65 @@ class VaultModal(ModalScreen[str]):
         if event.key == "escape":
             self.dismiss("")
 
+# -------------------------
+# Become Password Modal
+# -------------------------
+
+class BecomePasswordModal(ModalScreen[str]):
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="become-dialog"):
+            yield Static("Enter sudo password")
+            yield Input(
+                placeholder="sudo password",
+                password=True,
+                id="become_input",
+            )
+            yield Button("OK", id="ok")
+
+    def on_mount(self) -> None:
+        self.query_one("#become_input", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        password = self.query_one("#become_input", Input).value
+        self.dismiss(password)
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key == "escape":
+            self.dismiss("")
+
+# -------------------------
+# Sudoo Become Password Modal
+# -------------------------
+
+class SudoPasswordModal(ModalScreen[str]):
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="sudo-dialog"):
+            yield Static("Enter local sudo password")
+            yield Input(
+                placeholder="sudo password",
+                password=True,
+                id="sudo_input",
+            )
+            yield Button("OK", id="ok")
+
+    def on_mount(self) -> None:
+        self.query_one("#sudo_input", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        password = self.query_one("#sudo_input", Input).value
+        self.dismiss(password)
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key == "escape":
+            self.dismiss("")
 
 # -------------------------
 # Main Application
@@ -234,6 +310,8 @@ class AnsibleTUI(App):
         ("v", "vault_prompt", "Vault"),
         ("c", "toggle_check", "Check"),
         ("d", "toggle_diff", "Diff"),
+        ("b", "toggle_become", "Become"),
+        ("s", "toggle_sudo", "Sudo"),
         ("q", "quit", "Quit"),
     ]
 
@@ -242,8 +320,10 @@ class AnsibleTUI(App):
     vault_password = reactive("")
     check_mode = reactive(False)
     diff_mode = reactive(False)
+    become_enabled = reactive(False)
+    run_as_root = reactive(False)
 
-    current_command = reactive("")
+    current_command = reactive(list)
     run_output = reactive("") 
 
 
@@ -254,7 +334,9 @@ class AnsibleTUI(App):
     def __init__(self, project_path: Path, **kwargs):
         super().__init__(**kwargs)
         
-        self.vault_password: str | None = None
+        self.vault_password = None
+        self.vault_become = None
+        self.sudo_password = None    
        
         self.project = AnsibleProject(project_path)
         self.command_builder = CommandBuilder(self.project)
@@ -277,35 +359,33 @@ class AnsibleTUI(App):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
 
-        # ---- TOP CONTROL AREA ----
         with Horizontal(id="main"):
-
-            # Hosts
             with Vertical():
                 yield Tree("Inventory", id="inventory_tree")
-
-            # Roles
             with Vertical():
-                yield  Tree("Roles", id="roles")
-
-            # Playbook selector
-            self.playbook_select = Select(
-                [],
-                prompt="Select Playbook",
-                id="playbooks",
-            )
+                yield Tree("Roles", id="roles")
+            
+            self.playbook_select = Select([], prompt="Select Playbook", id="playbooks")
             with Vertical():
                 yield self.playbook_select
 
-        # ---- COMMAND PREVIEW ----
+        # --- NEW STATUS BAR ---
+        with Horizontal(id="status-bar"):
+            yield Static("FLAGS:", id="status-label")
+            yield Static("[CHECK OFF]", id="status-check")
+            yield Static("[DIFF OFF]", id="status-diff")
+            yield Static("[VAULT OFF]", id="status-vault")
+            yield Static("[BECOME OFF]", id="status-become")
+            yield Static("[SUDO OFF]", id="status-sudo")
+
         self.preview_widget = Static("", id="preview")
         yield self.preview_widget
 
-        # ------LOGS ---
         self.output_log = RichLog(id="output", highlight=True, markup=True)
         yield self.output_log
 
         yield Footer()
+
 
     @property
     def host_tree(self) -> Tree:
@@ -518,28 +598,6 @@ class AnsibleTUI(App):
                 self.create_node(root, role, "role")
 
     # -------------------------
-    # Toggle Selection
-    # -------------------------
-
-
-    async def action_toggle(self):
-        tree = self.focused
-        if not isinstance(tree, Tree):
-            return
-
-        node = tree.cursor_node
-        if not node or not node.data:
-            return
-
-        name = node.data["name"]
-
-        new_state = not node.data.get("checked", False)
-        self.set_checked_recursive(node, new_state)
-        self.update_selected_sets()
-
-        self.update_preview()
-
-    # -------------------------
     # Node selection event handling
     # -------------------------
     
@@ -560,23 +618,6 @@ class AnsibleTUI(App):
             self.refresh_node(node)
             self.update_selected_sets()
             self.update_preview()
-
-    def update_preview(self):
-        # Sync reactive states to the builder
-        self.command_builder.hosts = self.selected_hosts
-        self.command_builder.roles = self.selected_roles
-        self.command_builder.check = self.check_mode
-        self.command_builder.diff = self.diff_mode
-        
-        # CommandBuilder.build() already adds --limit and --tags
-        cmd = self.command_builder.build()
-
-        if self.vault_password:
-            # We add this placeholder here; the actual path is injected in action_run_playbook
-            cmd += " --vault-password-file .vault_pass"
-
-        self.current_command = cmd
-        self.query_one("#preview", Static).update(f"[bold green]{cmd}[/bold green]")
 
     # -------------------------
     # Recursive State Propogation
@@ -639,6 +680,69 @@ class AnsibleTUI(App):
         self.diff_mode = not self.diff_mode
         self.update_preview()
 
+    def action_toggle_become(self):
+        self.run_worker(
+            self.become_password_worker,
+            exclusive=True,
+            name="become-password",
+        )
+
+    async def become_password_worker(self):
+        # Turning Become OFF
+        if self.become_enabled:
+            self.become_enabled = False
+            self.become_password = None
+            self.update_preview()
+            return
+
+        # Become is being turned ON
+        self.run_as_root = False
+
+        password = await self.push_screen_wait(
+            BecomePasswordModal()
+        )
+
+        # User cancelled
+        if not password:
+            return
+
+        self.become_password = password
+        self.become_enabled = True
+
+        self.update_preview()
+
+    def action_toggle_sudo(self):
+        self.run_worker(
+            self.sudo_password_worker,
+            exclusive=True,
+            name="sudo-password",
+        )
+
+    async def sudo_password_worker(self):
+
+        # Turning sudo OFF
+        if self.run_as_root:
+            self.run_as_root = False
+            self.sudo_password = None
+            self.update_preview()
+            return
+
+        # Turning sudo ON
+        self.become_enabled = False
+
+        password = await self.push_screen_wait(
+            SudoPasswordModal()
+        )
+
+        # User cancelled
+        if not password:
+            return
+
+        self.sudo_password = password
+        self.run_as_root = True
+
+        self.update_preview()
+
     # -------------------------
     # Submit
     # -------------------------
@@ -651,60 +755,241 @@ class AnsibleTUI(App):
     # -------------------------
 
     def update_preview(self):
-        # The builder handles the logic of joining hosts and roles
+
+        # Synchronise CommandBuilder with UI state
         self.command_builder.hosts = self.selected_hosts
         self.command_builder.roles = self.selected_roles
         self.command_builder.check = self.check_mode
         self.command_builder.diff = self.diff_mode
-        
+        self.command_builder.become = self.become_enabled
+        self.command_builder.run_as_root = self.run_as_root
+
+        # Build command
         cmd = self.command_builder.build()
 
-        if self.vault_password:
-            # We add this here because the Builder doesn't know about the UI password state
-            cmd += " --vault-password-file .vault_pass"
-
+        # Vault is handled at execution time.
+        # Don't put a fake password path into the preview.
         self.current_command = cmd
-        self.query_one("#preview", Static).update(f"[bold green]{cmd}[/bold green]")
-    
+
+        # Update status indicators
+        check_widget = self.query_one("#status-check", Static)
+        diff_widget = self.query_one("#status-diff", Static)
+        vault_widget = self.query_one("#status-vault", Static)
+        become_widget = self.query_one("#status-become", Static)
+        sudo_widget = self.query_one("#status-sudo", Static)
+
+        if self.check_mode:
+            check_widget.update("[bold cyan]✓ CHECK ON[/]")
+        else:
+            check_widget.update("[dim]  CHECK OFF[/]")
+
+        if self.diff_mode:
+            diff_widget.update("[bold yellow]✓ DIFF ON[/]")
+        else:
+            diff_widget.update("[dim]  DIFF OFF[/]")
+
+        if self.vault_password:
+            vault_widget.update("[bold green]🔒 VAULT LOADED[/]")
+        else:
+            vault_widget.update("[dim]🔓 VAULT EMPTY[/]")
+
+        if self.become_enabled:
+            become_widget.update("[bold red]✓ BECOME ON[/]")
+        else:
+            become_widget.update("[dim]  BECOME OFF[/]")
+
+        if self.run_as_root:
+            sudo_widget.update("[bold red]✓ SUDO ON[/]")
+        else:
+            sudo_widget.update("[dim]  SUDO OFF[/]")    
+
+        # Command preview
+        preview = " ".join(cmd)
+
+        self.query_one("#preview", Static).update(
+            f"[bold green]{preview}[/bold green]"
+        )
+
     # -------------------------
     # Run Playbook
     # -------------------------
 
     async def action_run_playbook(self):
+
         if not self.current_command:
             return
 
         log = self.query_one("#output", RichLog)
         log.clear()
-        
+
+        cmd = list(self.current_command)
+
+        # Temporary credential files
         pass_file = None
-        final_cmd = self.current_command
-        
-        if self.vault_password:
-            pass_file = tempfile.NamedTemporaryFile(mode="w", delete=False)
-            pass_file.write(self.vault_password)
-            pass_file.close()
-            final_cmd = final_cmd.replace(".vault_pass", pass_file.name)
+        become_temp_file = None
 
-        log.write(f"Executing: {final_cmd}\n")
+        # -------------------------------------------------
+        # Local sudo
+        # -------------------------------------------------
 
-        process = await asyncio.create_subprocess_shell(
-            final_cmd,
-            cwd=self.project.root,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
+        if self.run_as_root:
+            cmd = [
+                "sudo",
+                "-S",
+                "-p",
+                "",
+            ] + cmd[1:]
 
-        async for line in process.stdout:
-            # FIX: Use .write() for RichLog
-            log.write(line.decode().rstrip() + "\n")
+        try:
 
-        await process.wait()
-        
-        if pass_file:
-            os.unlink(pass_file.name)
-            
-        log.write("\n[bold green]✓ Playbook run finished.[/bold green]\n")
+            # -------------------------------------------------
+            # Ansible Become password
+            # -------------------------------------------------
+
+            if self.become_enabled and self.become_password:
+
+                fd, become_temp_file = tempfile.mkstemp(
+                    prefix="ansible_become_"
+                )
+
+                try:
+                    os.write(
+                        fd,
+                        (self.become_password + "\n").encode()
+                    )
+                finally:
+                    os.close(fd)
+
+                os.chmod(become_temp_file, 0o600)
+
+                cmd.extend([
+                    "--become-password-file",
+                    become_temp_file,
+                ])
+
+            # -------------------------------------------------
+            # Ansible Vault password
+            # -------------------------------------------------
+
+            if self.vault_password:
+
+                fd, pass_file = tempfile.mkstemp(
+                    prefix="ansible_vault_"
+                )
+
+                try:
+                    os.write(
+                        fd,
+                        (self.vault_password + "\n").encode()
+                    )
+                finally:
+                    os.close(fd)
+
+                os.chmod(pass_file, 0o600)
+
+                cmd.extend([
+                    "--vault-password-file",
+                    pass_file,
+                ])
+
+            # -------------------------------------------------
+            # Display command
+            # -------------------------------------------------
+
+            display_cmd = " ".join(cmd)
+
+            log.write(
+                "[bold cyan]Executing:[/bold cyan]\n"
+                    f"{display_cmd}\n"
+            )
+
+            # -------------------------------------------------
+            # Run Ansible
+            # -------------------------------------------------
+
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=self.project.root,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                stdin=asyncio.subprocess.PIPE,
+            )
+
+            # -------------------------------------------------
+            # Supply local sudo password
+            # -------------------------------------------------
+
+            if self.run_as_root and self.sudo_password:
+
+                process.stdin.write(
+                    (self.sudo_password + "\n").encode()
+                )
+
+                await process.stdin.drain()
+
+            if process.stdin:
+                process.stdin.close()
+
+            # -------------------------------------------------
+            # Read output
+            # -------------------------------------------------
+
+            async for line in process.stdout:
+
+                text = line.decode(
+                    errors="replace"
+                ).rstrip()
+
+                log.write(text)
+
+            return_code = await process.wait()
+
+            # -------------------------------------------------
+            # Result
+            # -------------------------------------------------
+
+            if return_code == 0:
+
+                log.write(
+                    "\n[bold green]"
+                        "✓ Playbook completed successfully."
+                        "[/bold green]"
+                )
+
+            else:
+
+                log.write(
+                    f"\n[bold red]"
+                        f"✗ Playbook failed "
+                        f"(exit code {return_code})."
+                        f"[/bold red]"
+                )
+
+        except Exception as exc:
+
+            log.write(
+                f"\n[bold red]"
+                    f"Runner error: {exc}"
+                    f"[/bold red]"
+            )
+
+        finally:
+
+            # -------------------------------------------------
+            # Remove temporary credential files
+            # -------------------------------------------------
+
+            if become_temp_file and os.path.exists(become_temp_file):
+                try:
+                    os.remove(become_temp_file)
+                except OSError:
+                    pass
+
+            if pass_file and os.path.exists(pass_file):
+                try:
+                    os.remove(pass_file)
+                except OSError:
+                    pass
 
 
 if __name__ == "__main__":
